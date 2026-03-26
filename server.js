@@ -4,6 +4,7 @@ const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const https = require('https');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -42,7 +43,6 @@ async function uploadToCloudinary(buffer, mimetype, filename) {
     .update(`folder=varanasi-trip&timestamp=${timestamp}${apiSecret}`)
     .digest('hex');
 
-  // Build multipart manually using Buffer
   const boundary = '----FormBoundary' + crypto.randomBytes(8).toString('hex');
   const CRLF = '\r\n';
 
@@ -62,7 +62,6 @@ async function uploadToCloudinary(buffer, mimetype, filename) {
   const bodyEnd = Buffer.from(`${CRLF}--${boundary}--${CRLF}`, 'utf8');
   const body = Buffer.concat([bodyStart, buffer, bodyEnd]);
 
-  const https = require('https');
   const url = `https://api.cloudinary.com/v1_1/${cloudName}/${resourceType}/upload`;
 
   return new Promise((resolve, reject) => {
@@ -101,7 +100,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'No file provided' });
 
     const url = await uploadToCloudinary(req.file.buffer, req.file.mimetype, req.file.originalname);
-    console.log('Uploaded:', url);
+    console.log('Uploaded successfully:', url);
 
     const isVideo = req.file.mimetype.startsWith('video/');
     const data = readData();
