@@ -1,155 +1,121 @@
 const express = require('express');
 const multer = require('multer');
 const cors = require('cors');
-const { google } = require('googleapis');
 const fs = require('fs');
 const path = require('path');
-const stream = require('stream');
+const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const DATA_FILE = path.join(__dirname, 'data.json');
-const FOLDER_ID = '1_XrDptxcXTlHxHU9EMebPwv8lX1hPiM2';
 
-// JWT auth instead of GoogleAuth
-function getDriveClient() {
-  const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
-  if (!raw) throw new Error('GOOGLE_SERVICE_ACCOUNT_JSON missing!');
-  const credentials = JSON.parse(raw);
-  const auth = new google.auth.JWT(
-    credentials.client_email,
-    null,
-    credentials.private_key,
-    ['https://www.googleapis.com/auth/drive']
-  );
-  return google.drive({ version: 'v3', auth });
-}
-
-// ── CORS ──────────────────────────────────────────────────
-app.use(cors({
-  origin: '*',
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
-}));
+app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type'] }));
 app.options('*', cors());
 app.use(express.json());
 
-// ── Multer ────────────────────────────────────────────────
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 50 * 1024 * 1024 }
-});
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
 
-// ── Data helpers ──────────────────────────────────────────
 function readData() {
   try {
-    if (!fs.existsSync(DATA_FILE)) {
-      fs.writeFileSync(DATA_FILE, JSON.stringify({ files: [] }, null, 2));
-    }
+    if (!fs.existsSync(DATA_FILE)) fs.writeFileSync(DATA_FILE, JSON.stringify({ files: [] }, null, 2));
     return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-  } catch (e) {
-    console.error('readData error:', e.message);
-    return { files: [] };
-  }
+  } catch (e) { return { files: [] }; }
 }
 
 function writeData(data) {
-  try {
-    fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
-  } catch (e) {
-    console.error('writeData error:', e.message);
-  }
+  try { fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2)); } catch (e) { console.error(e); }
 }
 
-// ── Google Drive client ───────────────────────────────────
-function getDriveClient() {
-  const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
-  if (!raw) throw new Error('GOOGLE_SERVICE_ACCOUNT_JSON environment variable is missing!');
+async function uploadToCloudinary(buffer, mimetype, filename) {
+  const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
+  const apiKey = process.env.CLOUDINARY_API_KEY;
+  const apiSecret = process.env.CLOUDINARY_API_SECRET;
 
-  let credentials;
-  try {
-    credentials = JSON.parse(raw);
-  } catch (e) {
-    throw new Error('GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON: ' + e.message);
+  if (!cloudName || !apiKey || !apiSecret) throw new Error('Cloudinary env vars missing!');
+
+  const isVideo = mimetype.startsWith('video/');
+  const resourceType = isVideo ? 'video' : 'image';
+  const timestamp = Math.round(Date.now() / 1000);
+
+  const signature = crypto
+    .createHash('sha1')
+    .update(`folder=varanasi-trip&timestamp=${timestamp}${apiSecret}`)
+    .digest('hex');
+
+  // Build multipart manually using Buffer
+  const boundary = '----FormBoundary' + crypto.randomBytes(8).toString('hex');
+  const CRLF = '\r\n';
+
+  function field(name, value) {
+    return `--${boundary}${CRLF}Content-Disposition: form-data; name="${name}"${CRLF}${CRLF}${value}${CRLF}`;
   }
 
-  const auth = new google.auth.GoogleAuth({
-    credentials,
-    scopes: ['https://www.googleapis.com/auth/drive'],
+  const parts = [
+    field('api_key', apiKey),
+    field('timestamp', timestamp.toString()),
+    field('signature', signature),
+    field('folder', 'varanasi-trip'),
+    `--${boundary}${CRLF}Content-Disposition: form-data; name="file"; filename="${filename}"${CRLF}Content-Type: ${mimetype}${CRLF}${CRLF}`,
+  ];
+
+  const bodyStart = Buffer.from(parts.join(''), 'utf8');
+  const bodyEnd = Buffer.from(`${CRLF}--${boundary}--${CRLF}`, 'utf8');
+  const body = Buffer.concat([bodyStart, buffer, bodyEnd]);
+
+  const https = require('https');
+  const url = `https://api.cloudinary.com/v1_1/${cloudName}/${resourceType}/upload`;
+
+  return new Promise((resolve, reject) => {
+    const urlObj = new URL(url);
+    const options = {
+      hostname: urlObj.hostname,
+      path: urlObj.pathname,
+      method: 'POST',
+      headers: {
+        'Content-Type': `multipart/form-data; boundary=${boundary}`,
+        'Content-Length': body.length,
+      },
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          if (json.error) reject(new Error(json.error.message));
+          else resolve(json.secure_url);
+        } catch (e) { reject(e); }
+      });
+    });
+
+    req.on('error', reject);
+    req.write(body);
+    req.end();
   });
-  return google.drive({ version: 'v3', auth });
 }
 
-// ── POST /upload ──────────────────────────────────────────
 app.post('/upload', upload.single('file'), async (req, res) => {
   try {
-    console.log('Upload request received');
+    console.log('Upload started:', req.file?.originalname);
+    if (!req.file) return res.status(400).json({ error: 'No file provided' });
 
-    if (!req.file) {
-      return res.status(400).json({ error: 'No file provided' });
-    }
+    const url = await uploadToCloudinary(req.file.buffer, req.file.mimetype, req.file.originalname);
+    console.log('Uploaded:', url);
 
-    console.log('File:', req.file.originalname, req.file.mimetype, req.file.size);
-
-    const drive = getDriveClient();
-
-    const bufferStream = new stream.PassThrough();
-    bufferStream.end(req.file.buffer);
-
-    const driveRes = await drive.files.create({
-      requestBody: {
-        name: req.file.originalname,
-        parents: [FOLDER_ID],
-      },
-      media: {
-        mimeType: req.file.mimetype,
-        body: bufferStream,
-      },
-      fields: 'id, name',
-    });
-
-    const fileId = driveRes.data.id;
-    console.log('Uploaded to Drive, fileId:', fileId);
-
-    // Make public
-    await drive.permissions.create({
-      fileId,
-      requestBody: { role: 'reader', type: 'anyone' },
-    });
-    console.log('Made public');
-
-    const publicUrl = `https://drive.google.com/uc?id=${fileId}`;
-
-    // Save to data.json
+    const isVideo = req.file.mimetype.startsWith('video/');
     const data = readData();
-    data.files.unshift({
-      url: publicUrl,
-      name: req.file.originalname,
-      timestamp: new Date().toISOString()
-    });
+    data.files.unshift({ url, name: req.file.originalname, isVideo, timestamp: new Date().toISOString() });
     writeData(data);
 
-    console.log('Saved to data.json, responding success');
-    res.json({ success: true, url: publicUrl });
-
+    res.json({ success: true, url });
   } catch (err) {
     console.error('Upload error:', err.message);
-    console.error(err.stack);
     res.status(500).json({ error: err.message });
   }
 });
 
-// ── GET /files ────────────────────────────────────────────
-app.get('/files', (req, res) => {
-  const data = readData();
-  res.json(data);
-});
+app.get('/files', (req, res) => res.json(readData()));
+app.get('/', (req, res) => res.json({ status: 'ok', message: 'Varanasi Trip Backend Running ✅' }));
 
-// ── Health check ──────────────────────────────────────────
-app.get('/', (req, res) => {
-  res.json({ status: 'ok', message: 'Varanasi Trip Backend Running ✅' });
-});
-
-app.listen(PORT, () => {
-  console.log(`✅ Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
