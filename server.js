@@ -11,6 +11,20 @@ const PORT = process.env.PORT || 3000;
 const DATA_FILE = path.join(__dirname, 'data.json');
 const FOLDER_ID = '1_XrDptxcXTlHxHU9EMebPwv8lX1hPiM2';
 
+// JWT auth instead of GoogleAuth
+function getDriveClient() {
+  const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+  if (!raw) throw new Error('GOOGLE_SERVICE_ACCOUNT_JSON missing!');
+  const credentials = JSON.parse(raw);
+  const auth = new google.auth.JWT(
+    credentials.client_email,
+    null,
+    credentials.private_key,
+    ['https://www.googleapis.com/auth/drive']
+  );
+  return google.drive({ version: 'v3', auth });
+}
+
 // ── CORS ──────────────────────────────────────────────────
 app.use(cors({
   origin: '*',
